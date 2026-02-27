@@ -1,15 +1,24 @@
 # raml_agent.py
-# RAML generation agent using the latest LangChain API (langchain >= 1.0).
+# ─────────────────────────────────────────────────────────────────────────────
+# RAML Generation Agent — direct pipeline, LangChain for LLM interface only.
 #
-# create_agent() is the current recommended API — no AgentExecutor,
-# no hub.pull(), no initialize_agent(). Just model + tools list.
+# Architecture:
+#   - No ReAct agent loop — pipeline calls each step directly in order
+#   - LangChain ChatAnthropic for LLM calls (same interface as ChatOpenAI)
+#   - RAMLSession holds per-project files + conversation history
+#   - LessonMemory lessons are injected into system prompt (not passed via agent)
 #
-# File structure:
+# One chat() turn = exactly 2 LLM calls:
+#   1. generate()     — main RAML generation (big call)
+#   2. save_lesson()  — lesson extraction (tiny background call, feedback turns only)
+#
+# File layout:
 #   raml_prompts.py  — all prompts as constants
-#   raml_tools.py    — @tool functions + build_tools() factory
-#   raml_agent.py    — THIS: agent init, sessions, chat()
-#   lesson_memory.py — Pinecone lesson store (unchanged)
-#   raml_server.py   — FastAPI wrapper (unchanged)
+#   raml_tools.py    — fetch_context, fetch_lessons, generate, save_lesson
+#   raml_agent.py    — THIS: sessions, pipeline orchestration, file I/O
+#   lesson_memory.py — Pinecone lesson store
+#   raml_server.py   — FastAPI wrapper
+# ─────────────────────────────────────────────────────────────────────────────
 
 import os
 import re
@@ -22,14 +31,13 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 
 load_dotenv()
 
 from retriever     import RAGRetriever
 from lesson_memory import LessonMemory
-from raml_tools    import build_tools, parse_json_safe
+from raml_tools    import fetch_context, fetch_lessons, generate, save_lesson, parse_json_safe
 
 # ── Config ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR   = Path(os.getenv("RAML_OUTPUT_DIR", "output"))
@@ -40,13 +48,13 @@ CLAUDE_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 # ── Session ───────────────────────────────────────────────────────────────────
 
 class RAMLSession:
-    """Holds all state for one project — files on disk + conversation history."""
+    """Holds all state for one project — files + conversation history."""
 
     def __init__(self, session_id: str, project_name: str):
         self.session_id   = session_id
         self.project_name = project_name
         self.history: list[dict]     = []   # [{role, content}, ...]
-        self.files:   dict[str, str] = {}   # path → file content
+        self.files:   dict[str, str] = {}   # path → file content (live state)
         self.created_at  = datetime.now().isoformat()
         self.project_dir = OUTPUT_DIR / session_id
 
@@ -65,10 +73,8 @@ class RAMLSession:
 
 class RAMLAgent:
     """
-    RAML generation agent — latest LangChain API.
-
-    create_agent(model, tools=[...]) is all that's needed.
-    Tools are plain @tool-decorated functions from raml_tools.py.
+    Orchestrates the 4-step RAML generation pipeline.
+    Uses LangChain ChatAnthropic as the LLM — drop-in for ChatOpenAI.
     """
 
     def __init__(
@@ -87,38 +93,31 @@ class RAMLAgent:
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
 
-        # LLM — ChatAnthropic is a drop-in for ChatOpenAI
-        llm = ChatAnthropic(
+        # LangChain LLM — same interface as ChatOpenAI
+        self.llm = ChatAnthropic(
             model             = claude_model,
-            temperature       = 0,
+            temperature       = 0.3,
             max_tokens        = 8096,
             anthropic_api_key = api_key,
         )
 
         # RAG retriever
-        rag = None
+        self._rag = None
         self._rag_ready = False
         try:
-            rag = RAGRetriever(index_name=index_name, verbose=verbose)
+            self._rag = RAGRetriever(index_name=index_name, verbose=verbose)
             self._rag_ready = True
         except Exception as e:
             if verbose: print(f"[RAMLAgent] RAG unavailable: {e}")
 
         # Lesson memory
-        lessons = None
+        self._lesson_memory = None
         self._lessons_ready = False
         try:
-            lessons = LessonMemory(index_name=index_name, verbose=verbose)
+            self._lesson_memory = LessonMemory(index_name=index_name, verbose=verbose)
             self._lessons_ready = True
         except Exception as e:
             if verbose: print(f"[RAMLAgent] Lessons unavailable: {e}")
-
-        # Store for lesson surfacing
-        self._lesson_memory = lessons
-
-        # Build tools and create agent — that's it, no AgentExecutor needed
-        tools = build_tools(rag_retriever=rag, lesson_memory=lessons, llm=llm)
-        self.agent = create_agent(llm, tools=tools)
 
     # ── Session management ────────────────────────────────────────────────────
 
@@ -141,35 +140,47 @@ class RAMLAgent:
 
     def chat(self, session_id: str, message: str) -> dict:
         """
-        Run one turn through the agent.
-        Agent autonomously calls tools in order: retrieve_context →
-        retrieve_lessons → generate_raml → extract_lesson (feedback turns).
-        Returns a dict compatible with raml_server.py.
+        Run the 4-step pipeline for one conversation turn.
+
+        Steps:
+          1. fetch_context  — RAG lookup (no LLM call)
+          2. fetch_lessons  — Pinecone lookup (no LLM call)
+          3. generate       — 1 LLM call: lessons in system prompt, context in user msg
+          4. save_lesson    — 1 cheap LLM call (feedback turns only)
+
+        Total: 1–2 LLM calls per turn. Same speed as the original direct SDK version.
         """
         session  = self.get_session(session_id)
         if not session:
             raise ValueError(f"Session '{session_id}' not found")
 
         is_first = len(session.history) == 0
-        query    = self._build_query(message, session, is_first)
 
-        # Run agent — create_agent returns a standard runnable
-        try:
-            result     = self.agent.invoke({"messages": [("human", query)]})
-            # Latest API: result is a dict with "messages" list;
-            # the last AI message is the final answer
-            raw_output = result["messages"][-1].content
-        except Exception as e:
-            if self.verbose: print(f"[RAMLAgent] agent error: {e}")
-            raw_output = json.dumps({"message": f"Error: {e}", "files": [], "changed_files": [], "deleted_files": []})
+        # ── Step 1: RAG context ───────────────────────────────────────────────
+        context, sources = fetch_context(self._rag, message)
 
-        # Parse JSON from the generate_raml tool output surfaced as final answer
-        parsed        = parse_json_safe(raw_output)
-        changed_files = parsed.get("changed_files", [])
-        deleted_files = parsed.get("deleted_files", [])
-        new_files     = parsed.get("files", [])
+        # ── Step 2: Lessons (injected directly into system prompt) ────────────
+        lessons_block, lessons_used = fetch_lessons(self._lesson_memory, message)
 
-        # Write new/updated files to disk
+        if self.verbose and lessons_used:
+            print(f"[RAMLAgent] Injecting {len(lessons_used)} lessons into system prompt")
+            for l in lessons_used:
+                print(f"  [{l['category']}] {l['correction'][:70]}")
+
+        # ── Step 3: Generate RAML ─────────────────────────────────────────────
+        result = generate(
+            llm           = self.llm,
+            request       = message,
+            context       = context,
+            lessons_block = lessons_block,   # prepended to system prompt
+            current_files = session.files if not is_first else {},
+        )
+
+        changed_files = result.get("changed_files", [])
+        deleted_files = result.get("deleted_files", [])
+        new_files     = result.get("files", [])
+
+        # Write / update files on disk
         for f in new_files:
             path, content = f["path"], f["content"]
             session.files[path] = content
@@ -192,85 +203,39 @@ class RAMLAgent:
             changed_files = [f["path"] for f in new_files]
 
         # Update conversation history
+        agent_message = result.get("message", "Done.")
         session.history.append({"role": "user",      "content": message})
-        session.history.append({"role": "assistant", "content": parsed.get("message", "")})
+        session.history.append({"role": "assistant", "content": agent_message})
 
-        # Surface lesson_saved if extract_lesson ran this turn
-        lesson_saved = self._find_lesson_in_result(result)
+        # ── Step 4: Save lesson silently (feedback turns only) ────────────────
+        lesson_saved = None
+        if not is_first:
+            last_reply = session.history[-2]["content"] if len(session.history) >= 2 else ""
+            lesson_saved = save_lesson(
+                llm           = self.llm,
+                lesson_memory = self._lesson_memory,
+                last_message  = last_reply,
+                user_feedback = message,
+                project_name  = session.project_name,
+            )
+            if self.verbose and lesson_saved:
+                print(f"[RAMLAgent] Lesson saved: [{lesson_saved['category']}] {lesson_saved['correction'][:60]}")
 
         return {
-            "message":       parsed.get("message", "Done."),
+            "message":       agent_message,
             "files":         dict(session.files),
             "changed_files": changed_files,
             "deleted_files": deleted_files,
-            "sources":       [],
-            "lessons_used":  [],
+            "sources":       sources,
+            "lessons_used":  [
+                {"id": l["id"], "correction": l["correction"], "category": l["category"]}
+                for l in lessons_used
+            ],
             "lesson_saved":  lesson_saved,
             "tokens_used":   {"input": 0, "output": 0},
             "is_first_turn": is_first,
             "session":       session.to_dict(),
         }
-
-    # ── Query builders ────────────────────────────────────────────────────────
-
-    def _build_query(self, message: str, session: RAMLSession, is_first: bool) -> str:
-        """
-        Build an explicit step-by-step task for the agent.
-        Mirrors the AML.py style: numbered steps tell the agent exactly what to do.
-        """
-        if is_first:
-            return f"""
-Complete these steps in order:
-1. Call retrieve_context("{message}")
-2. Call retrieve_lessons("{message}")
-3. Call generate_raml with:
-   - request = "{message}"
-   - context = <output of step 1>
-   - lessons = <output of step 2>
-   - current_files = ""
-Return the JSON output from generate_raml as your final answer.
-"""
-        # Feedback turn — pass current files and trigger lesson extraction
-        files_json = json.dumps(
-            {p: c[:600] + ("..." if len(c) > 600 else "") for p, c in session.files.items()},
-            indent=2
-        )
-        last_reply = next(
-            (h["content"] for h in reversed(session.history) if h["role"] == "assistant"), ""
-        )
-        return f"""
-Complete these steps in order:
-1. Call retrieve_context("{message}")
-2. Call retrieve_lessons("{message}")
-3. Call generate_raml with:
-   - request = "{message}"
-   - context = <output of step 1>
-   - lessons = <output of step 2>
-   - current_files = {files_json}
-4. Call extract_lesson with:
-   - agent_response = {json.dumps(last_reply[:400])}
-   - user_feedback = "{message}"
-   - project_name = "{session.project_name}"
-Return the JSON output from generate_raml as your final answer.
-"""
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _find_lesson_in_result(self, result: dict) -> Optional[dict]:
-        """
-        Scan agent messages for an ExtractLesson tool call result.
-        create_agent returns all messages including ToolMessages in result["messages"].
-        """
-        try:
-            for msg in result.get("messages", []):
-                # ToolMessage has name = tool name, content = tool output
-                if getattr(msg, "name", "") == "extract_lesson":
-                    data = parse_json_safe(msg.content)
-                    if data.get("saved"):
-                        return data
-        except Exception:
-            pass
-        return None
 
     # ── File ops ──────────────────────────────────────────────────────────────
 

@@ -1,38 +1,50 @@
 # raml_tools.py
-# Tool definitions using the modern @tool decorator (langchain >= 1.0).
-# Each tool is a plain Python function — no class, no boilerplate.
-# Import build_tools() into raml_agent.py and pass the returned list to create_agent().
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure pipeline functions — called directly and in order, no agent loop.
+#
+# Why not ReAct agent?
+#   RAML generation is a fixed 4-step pipeline. An agent loop adds 3-4 extra
+#   LLM round-trips just to "decide" what to do — and worse, loses structured
+#   data between steps (lessons string gets dropped by the text chain).
+#   Direct function calls: faster, reliable, lessons always injected correctly.
+#
+# Pipeline order (called from raml_agent.py):
+#   1. fetch_context(query)            → RAG context string + sources
+#   2. fetch_lessons(query)            → lessons block injected into system prompt
+#   3. generate(llm, request, ...)     → dict with files, message, changed_files
+#   4. save_lesson(llm, ...)           → lesson saved silently (feedback turns only)
+# ─────────────────────────────────────────────────────────────────────────────
 
 import json
 import re
-from langchain.tools import tool
+
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from raml_prompts import RAML_GENERATION_PROMPT, LESSON_EXTRACTION_PROMPT
 
 
-# ── Shared helpers ────────────────────────────────────────────────────────────
+# ── Shared: robust JSON parser ────────────────────────────────────────────────
 
 def parse_json_safe(text: str) -> dict:
     """
-    Parse JSON from an LLM response — never raises.
-    Handles markdown fences, preamble text, and partial output.
+    Parse JSON from LLM output — never raises.
+    Handles: plain JSON, markdown fences, preamble text, partial output.
     """
     text = text.strip()
-    # Try 1: direct
+    # 1. Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Try 2: strip fences
+    # 2. Strip markdown fences then retry
     cleaned = re.sub(r"^```(?:json)?\s*\n?", "", text, flags=re.MULTILINE)
     cleaned = re.sub(r"\n?```\s*$", "", cleaned, flags=re.MULTILINE).strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    # Try 3: bracket-counting to find outermost { }
+    # 3. Bracket-count to extract outermost { ... } (handles preamble text)
     start = text.find("{")
     if start != -1:
         depth = 0
@@ -46,128 +58,155 @@ def parse_json_safe(text: str) -> dict:
                         return json.loads(text[start:i + 1])
                     except json.JSONDecodeError:
                         break
-    # Fallback: return text as message so UI still renders something
+    # Fallback — surface text as message, never crash
     return {"message": text, "files": [], "changed_files": [], "deleted_files": []}
 
 
-def clean_raml(path: str, content: str) -> str:
-    """Strip fences and ensure .raml files start with #%RAML 1.0."""
+def _clean_raml(path: str, content: str) -> str:
+    """Strip fences and ensure every .raml file starts with #%RAML 1.0."""
     content = re.sub(r"^```[a-z]*\n?", "", content, flags=re.MULTILINE)
-    content = re.sub(r"\n?```$", "", content, flags=re.MULTILINE).strip()
+    content = re.sub(r"\n?```$",       "", content, flags=re.MULTILINE).strip()
     if path.endswith(".raml") and not content.startswith("#%RAML"):
         content = "#%RAML 1.0\n" + content
     return content
 
 
-# ── Tool factory ──────────────────────────────────────────────────────────────
-# We use a factory because tools need injected dependencies (retriever, lessons, llm).
-# The @tool decorator is applied inside the factory so closures capture the deps.
+# ── Step 1: RAG retrieval ─────────────────────────────────────────────────────
 
-def build_tools(rag_retriever, lesson_memory, llm: ChatAnthropic) -> list:
+def fetch_context(rag_retriever, query: str) -> tuple[str, list]:
     """
-    Build all @tool-decorated functions with injected dependencies.
-    Returns a plain list ready to pass to create_agent().
+    Retrieve relevant RAML patterns from the knowledge base.
+    Returns (context_string, sources_list).
     """
-
-    @tool
-    def retrieve_context(query: str) -> str:
-        """
-        Retrieve relevant RAML patterns from the knowledge base for the given query.
-        Call this first on every generation turn.
-        """
-        if rag_retriever is None:
-            return "Knowledge base not connected."
-        try:
-            return rag_retriever.retrieve_for_llm(query=query, top_k=5)
-        except Exception as e:
-            return f"Retrieval error: {e}"
-
-    @tool
-    def retrieve_lessons(query: str) -> str:
-        """
-        Retrieve learned rules from past corrections relevant to this query.
-        Call this after retrieve_context, before generating files.
-        Returns a block of rules the agent must follow, or empty string if none.
-        """
-        if lesson_memory is None:
-            return ""
-        try:
-            lessons = lesson_memory.retrieve(query=query)
-            if not lessons:
-                return ""
-            rules = "\n".join(
-                f"{i}. [{l['category'].upper()}] {l['correction']}"
-                for i, l in enumerate(lessons, 1)
-            )
-            return f"MANDATORY RULES from past corrections:\n{rules}"
-        except Exception as e:
-            return f"Lesson retrieval error: {e}"
-
-    @tool
-    def generate_raml(request: str, context: str = "", lessons: str = "", current_files: str = "") -> str:
-        """
-        Generate or update RAML project files.
-        Args:
-            request:       The user's API description or feedback message.
-            context:       Output from retrieve_context tool.
-            lessons:       Output from retrieve_lessons tool.
-            current_files: JSON string of existing files for feedback turns (empty for first turn).
-        Returns JSON with: message, files, changed_files, deleted_files.
-        """
-        # Build system prompt — learned rules on top, base rules below
-        system = "\n\n".join(filter(None, [lessons, RAML_GENERATION_PROMPT]))
-
-        # Build user message
-        parts = []
-        if context:
-            parts.append(f"<retrieved_context>\n{context}\n</retrieved_context>")
-        if current_files:
-            parts.append(f"Current project files:\n{current_files}")
-        parts.append(f"User request: {request}")
-
-        messages = [
-            SystemMessage(content=system),
-            HumanMessage(content="\n\n---\n\n".join(parts)),
+    if rag_retriever is None:
+        return "", []
+    try:
+        raw     = rag_retriever.retrieve(query=query, top_k=5)
+        context = rag_retriever.retrieve_for_llm(query=query, top_k=5)
+        sources = [
+            {
+                "file":   r["source_file"],
+                "type":   r["source_type"],
+                "detail": r.get("resource_path") or r.get("section", ""),
+                "score":  round(r["score"], 3),
+            }
+            for r in raw
         ]
-        response = llm.invoke(messages)
-        parsed   = parse_json_safe(response.content)
+        return context, sources
+    except Exception as e:
+        return f"[RAG error: {e}]", []
 
-        # Clean RAML content in every returned file
-        for f in parsed.get("files", []):
-            f["content"] = clean_raml(f["path"], f["content"])
 
-        return json.dumps(parsed)
+# ── Step 2: Lesson retrieval ──────────────────────────────────────────────────
 
-    @tool
-    def extract_lesson(agent_response: str, user_feedback: str, project_name: str = "") -> str:
-        """
-        Detect if the user is correcting a mistake and silently save the lesson.
-        Call this only on feedback turns, after generate_raml.
-        Args:
-            agent_response: The agent's previous reply (what the user is reacting to).
-            user_feedback:  The user's correction or feedback message.
-            project_name:   Name of the current project (for display in lesson list).
-        Returns JSON: {"saved": true, ...lesson fields} or {"saved": false}.
-        """
-        if lesson_memory is None:
-            return json.dumps({"saved": False})
+def fetch_lessons(lesson_memory, query: str) -> tuple[str, list]:
+    """
+    Retrieve learned rules from Pinecone for the current query.
+    Returns (lessons_block, raw_lessons_list).
 
-        prompt = f"Agent's response:\n{agent_response[:500]}\n\nUser follow-up:\n{user_feedback}"
-        messages = [
+    The lessons_block is prepended directly to the system prompt — this
+    guarantees the rules are seen before generation. Passing lessons through
+    an agent text chain is unreliable; this is the correct approach.
+    """
+    if lesson_memory is None:
+        return "", []
+    try:
+        lessons = lesson_memory.retrieve(query=query)
+        if not lessons:
+            return "", []
+        rules = "\n".join(
+            f"{i}. [{l['category'].upper()}] {l['correction']}"
+            for i, l in enumerate(lessons, 1)
+        )
+        block = (
+            "<learned_rules>\n"
+            "MANDATORY — follow these rules learned from past corrections. "
+            "Violating them is not allowed:\n\n"
+            f"{rules}\n"
+            "</learned_rules>"
+        )
+        return block, lessons
+    except Exception as e:
+        return "", []
+
+
+# ── Step 3: RAML generation ───────────────────────────────────────────────────
+
+def generate(
+    llm:           ChatAnthropic,
+    request:       str,
+    context:       str,
+    lessons_block: str,
+    current_files: dict,
+) -> dict:
+    """
+    Single LLM call to generate or update RAML project files.
+
+    lessons_block is prepended to the system prompt so it is read before
+    the base rules — this is the only reliable way to enforce learned rules.
+
+    Returns dict: {message, files, changed_files, deleted_files}.
+    """
+    # Lessons first → base rules second (order matters for attention)
+    system = "\n\n".join(p for p in [lessons_block, RAML_GENERATION_PROMPT] if p)
+
+    # Build user message
+    parts = []
+    if context:
+        parts.append(f"<retrieved_context>\n{context}\n</retrieved_context>")
+    if current_files:
+        files_summary = "\n\n".join(
+            f"=== {p} ===\n{c[:1000]}{'...(truncated)' if len(c) > 1000 else ''}"
+            for p, c in current_files.items()
+        )
+        parts.append(f"Current project files:\n{files_summary}")
+    parts.append(f"User request: {request}")
+
+    response = llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content="\n\n---\n\n".join(parts)),
+    ])
+    parsed = parse_json_safe(response.content)
+
+    # Ensure all RAML files are clean
+    for f in parsed.get("files", []):
+        f["content"] = _clean_raml(f["path"], f["content"])
+
+    return parsed
+
+
+# ── Step 4: Lesson extraction (feedback turns only) ───────────────────────────
+
+def save_lesson(
+    llm:           ChatAnthropic,
+    lesson_memory,
+    last_message:  str,
+    user_feedback: str,
+    project_name:  str,
+) -> dict | None:
+    """
+    Background call: detect if user feedback is a correction, save lesson silently.
+    Returns the saved lesson dict, or None if not a correction.
+    """
+    if lesson_memory is None:
+        return None
+    try:
+        response = llm.bind(max_tokens=150).invoke([
             SystemMessage(content=LESSON_EXTRACTION_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-        # Cheap call — small output, no streaming needed
-        response = llm.bind(max_tokens=150).invoke(messages)
-        result   = parse_json_safe(response.content)
+            HumanMessage(content=(
+                f"Agent's last response:\n{last_message[:500]}\n\n"
+                f"User follow-up:\n{user_feedback}"
+            )),
+        ])
+        result = parse_json_safe(response.content)
 
         if not result.get("is_correction"):
-            return json.dumps({"saved": False})
+            return None
 
         mistake    = result.get("mistake", "").strip()
         correction = result.get("correction", "").strip()
         if not mistake or not correction:
-            return json.dumps({"saved": False, "reason": "incomplete extraction"})
+            return None
 
         lesson_id = lesson_memory.save(
             mistake      = mistake,
@@ -175,12 +214,11 @@ def build_tools(rag_retriever, lesson_memory, llm: ChatAnthropic) -> list:
             category     = result.get("category", "general"),
             project_name = project_name,
         )
-        return json.dumps({
-            "saved":      True,
+        return {
             "id":         lesson_id,
             "mistake":    mistake,
             "correction": correction,
             "category":   result.get("category", "general"),
-        })
-
-    return [retrieve_context, retrieve_lessons, generate_raml, extract_lesson]
+        }
+    except Exception:
+        return None
