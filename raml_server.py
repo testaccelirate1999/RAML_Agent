@@ -9,6 +9,9 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+from anypoint_publisher import AnypointConfig, AnypointPublisher
+import traceback
+
 load_dotenv()
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from raml_agent import RAMLAgent
@@ -138,3 +141,35 @@ def delete_lesson(lesson_id: str):
         raise HTTPException(503, "Lesson memory not available")
     agent._lesson_memory.delete(lesson_id)
     return {"deleted": lesson_id}
+
+# ── Anypoint Design Center publish ────────────────────────────────────────────
+
+class PublishRequest(BaseModel):
+    project_name: str = ""   # override name, defaults to session project_name
+
+@app.post("/sessions/{session_id}/publish")
+def publish_to_anypoint(session_id: str, req: PublishRequest):
+    """
+    Push the generated RAML project to Anypoint Design Center.
+    Requires ANYPOINT_USERNAME, ANYPOINT_PASSWORD, ANYPOINT_ORG_ID in .env
+    """
+    agent   = get_agent()
+    session = agent.get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if not session.files:
+        raise HTTPException(400, "No files to publish. Generate the project first.")
+
+    try:
+        config    = AnypointConfig.from_env()
+        publisher = AnypointPublisher(config, verbose=True)
+        name      = req.project_name or session.project_name
+        result    = publisher.publish(project_name=name, files=session.files)
+        # Release lock so collaborators can edit in Design Center
+        publisher.release_lock(result["project_id"])
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        traceback.print_exc()   # prints full stack trace in terminal
+        raise HTTPException(502, f"Anypoint publish failed: {str(e)}")
