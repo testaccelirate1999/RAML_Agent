@@ -9,15 +9,21 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from anypoint_publisher import AnypointConfig, AnypointPublisher
-import traceback
-
 load_dotenv()
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from raml_agent import RAMLAgent
 
 app = FastAPI(title="RAML Generation API", version="3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+async def on_startup():
+    print("\n" + "="*55)
+    print("  RAML Agent Server v3.0  —  ready on :8001")
+    print("="*55)
+    routes = [f"  {r.methods} {r.path}" for r in app.routes if hasattr(r, "methods")]
+    for r in sorted(routes): print(r)
+    print("="*55 + "\n")
 
 _agent: Optional[RAMLAgent] = None
 def get_agent() -> RAMLAgent:
@@ -142,15 +148,47 @@ def delete_lesson(lesson_id: str):
     agent._lesson_memory.delete(lesson_id)
     return {"deleted": lesson_id}
 
-# ── Anypoint Design Center publish ────────────────────────────────────────────
+# ── Anypoint Design Center push ──────────────────────────────────────────────
 
-class PublishRequest(BaseModel):
-    project_name: str = ""   # override name, defaults to session project_name
+class PushRequest(BaseModel):
+    project_name:    str  = ""     # override name, defaults to session project_name
+    skip_validation: bool = False  # allow pushing even with validation errors
 
-@app.post("/sessions/{session_id}/publish")
-def publish_to_anypoint(session_id: str, req: PublishRequest):
+@app.post("/sessions/{session_id}/validate")
+def validate_raml(session_id: str):
     """
-    Push the generated RAML project to Anypoint Design Center.
+    Run pre-push RAML 1.0 validation on the current project files.
+    Returns list of {file, line, severity, message} issues.
+    """
+    from anypoint_publisher import RAMLValidator
+    agent   = get_agent()
+    session = agent.get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if not session.files:
+        raise HTTPException(400, "No files to validate. Generate the project first.")
+    try:
+        validator = RAMLValidator()
+        errors    = validator.validate(session.files)
+        error_count   = sum(1 for e in errors if e["severity"] == "error")
+        warning_count = sum(1 for e in errors if e["severity"] == "warning")
+        print(f"[Validate] {len(session.files)} files → {error_count} errors, {warning_count} warnings")
+        for e in errors:
+            print(f"  [{e['severity'].upper()}] {e['file']}:{e['line']} — {e['message'][:80]}")
+        return {
+            "errors":        errors,
+            "error_count":   error_count,
+            "warning_count": warning_count,
+            "valid":         error_count == 0,
+        }
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Validation error: {e}")
+
+@app.post("/sessions/{session_id}/push")
+def push_to_anypoint(session_id: str, req: PushRequest):
+    """
+    Validate then push RAML project to Anypoint Design Center.
     Requires ANYPOINT_USERNAME, ANYPOINT_PASSWORD, ANYPOINT_ORG_ID in .env
     """
     agent   = get_agent()
@@ -158,18 +196,19 @@ def publish_to_anypoint(session_id: str, req: PublishRequest):
     if not session:
         raise HTTPException(404, "Session not found")
     if not session.files:
-        raise HTTPException(400, "No files to publish. Generate the project first.")
-
+        raise HTTPException(400, "No files to push. Generate the project first.")
     try:
-        config    = AnypointConfig.from_env()
+        from anypoint_publisher import AnypointPublisher, AnypointConfig
+        config = AnypointConfig.from_env()
         publisher = AnypointPublisher(config, verbose=True)
         name      = req.project_name or session.project_name
-        result    = publisher.publish(project_name=name, files=session.files)
-        # Release lock so collaborators can edit in Design Center
-        publisher.release_lock(result["project_id"])
+        result    = publisher.push(
+            project_name    = name,
+            files           = session.files,
+            skip_validation = req.skip_validation,
+        )
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        traceback.print_exc()   # prints full stack trace in terminal
-        raise HTTPException(502, f"Anypoint publish failed: {str(e)}")
+        raise HTTPException(502, f"Anypoint push failed: {e}")
